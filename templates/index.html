@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8">
+  <title>ISP Simulator - Budapesti Hálózat</title>
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <style>
+    body { margin: 0; padding: 0; font-family: sans-serif; }
+    #map { width: 100%; height: 90vh; }
+    #info { padding: 10px; background: #f4f4f4; }
+    button { margin: 3px; }
+    /* Stílus a kábel választó menühöz */
+    #cableMenu {
+      display: none;
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      padding: 10px;
+      background: #fff;
+      border: 1px solid #ccc;
+      box-shadow: 2px 2px 6px rgba(0,0,0,0.3);
+      z-index: 1000;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">
+    <button id="simulate-btn">Szimuláció (Manuális)</button>
+    <button id="reset-btn">Újrakezdés</button>
+    <span id="money-display">Pénz: 1000</span>
+  </div>
+
+  <!-- Lenyíló menü a kábel típusának kiválasztásához -->
+  <div id="cableMenu">
+    <label for="cableSelect">Válaszd ki a kábel típusát:</label>
+    <select id="cableSelect">
+      <!-- Az opciókat a kapcsolat felvételekor dinamikusan töltjük fel -->
+    </select>
+    <br>
+    <button id="connectCableBtn">Kábel bekötése</button>
+    <button id="cancelCableBtn">Mégsem</button>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <!-- jQuery az AJAX hívásokhoz -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script>
+    // Globális változók
+    var cableCostPerKm = 100; // Ugyanaz, mint a backendben
+    function computeDistance(lat1, lon1, lat2, lon2) {
+      var R = 6371;
+      var dLat = (lat2 - lat1) * Math.PI / 180;
+      var dLon = (lon2 - lon1) * Math.PI / 180;
+      var a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) *
+              Math.sin(dLon/2) * Math.sin(dLon/2);
+      var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    var map = L.map('map').setView([47.4979, 19.0402], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    var gameState = {};
+    var pendingConnection = null;
+    var buildingMarkers = {};
+    var cableLayers = {};
+
+    function getBuildingColor(building) {
+      if (building.is_exit) return "red";
+      var demand = building.demand || 100;
+      if (demand <= 100) return "green";
+      else if (demand <= 200) return "blue";
+      else if (demand <= 300) return "orange";
+      else return "purple";
+    }
+
+    function cableLineWeight(level) {
+      switch(level) {
+        case 1: return 2;
+        case 2: return 4;
+        case 3: return 6;
+        case 4: return 8;
+        case 5: return 10;
+        default: return 2;
+      }
+    }
+
+    function loadState() {
+      $.getJSON("/state", function(data) {
+        gameState = data;
+        updateMoney();
+        updateBuildings();
+        updateCables();
+      });
+    }
+
+    function updateMoney() {
+      $("#money-display").text("Pénz: " + gameState.money);
+    }
+
+    function updateBuildings() {
+      for (var key in buildingMarkers) {
+        map.removeLayer(buildingMarkers[key]);
+      }
+      buildingMarkers = {};
+      for (var id in gameState.buildings) {
+        var b = gameState.buildings[id];
+        var color = getBuildingColor(b);
+        var marker = L.circleMarker([b.lat, b.lng], {
+          color: color,
+          fillColor: color,
+          fillOpacity: 0.8,
+          radius: 8
+        }).addTo(map);
+        var popupContent = "";
+        if (b.is_exit) {
+          popupContent = "<b>" + b.name + "</b><br><i>Internet kijárat</i>" +
+                         "<br><button onclick='selectDevice(\"" + id + "\")'>Választás</button>";
+        } else {
+          popupContent = "<b>" + b.name + " (" + b.region + ")</b><br>" +
+                         "Eszköz: " + (b.device_installed ? b.device_status : "Nincs eszköz") + "<br>" +
+                         "Demand: " + (b.demand || 100) + " Mbit/s<br>";
+          if (!b.device_installed) {
+            popupContent += "<button onclick='installDevice(\"" + id + "\")'>Telepítés</button>";
+          } else if (b.device_status === "FAULT") {
+            popupContent += "<button onclick='repairDevice(\"" + id + "\")'>Javítás</button>";
+          }
+          popupContent += "<br><button onclick='selectDevice(\"" + id + "\")'>Választás</button>";
+        }
+        marker.bindPopup(popupContent);
+        buildingMarkers[id] = marker;
+      }
+    }
+
+    function updateCables() {
+      for (var cid in cableLayers) {
+        map.removeLayer(cableLayers[cid]);
+      }
+      cableLayers = {};
+      for (var cid in gameState.cables) {
+        var cable = gameState.cables[cid];
+        var fromB = gameState.buildings[cable.from];
+        var toB = gameState.buildings[cable.to];
+        var latlngs = [
+          [fromB.lat, fromB.lng],
+          [toB.lat, toB.lng]
+        ];
+        var color = "darkblue";
+        if (cable.status !== "OK") {
+          color = "red";
+        } else if (cable.capacity && (cable.current_load / cable.capacity) >= 0.6) {
+          color = "yellow";
+        }
+        var weight = cableLineWeight(cable.level);
+        var loadText = "";
+        if (typeof cable.current_load !== "undefined" && typeof cable.capacity !== "undefined") {
+          loadText = cable.current_load + " / " + cable.capacity + " Mbit/s";
+        }
+        var popupContent = "<b>Kábel: " + cid + "</b><br>" +
+                           "Szint: " + cable.level + "<br>" +
+                           "Státusz: " + cable.status + "<br>" +
+                           "Távolság: " + cable.distance + " km<br>" +
+                           "Sávszélesség: " + loadText + "<br>" +
+                           "<button onclick='upgradeCable(\"" + cid + "\")'>Upgrade</button>" +
+                           "<button onclick='repairCable(\"" + cid + "\")'>Javítás</button>" +
+                           "<button onclick='deleteCable(\"" + cid + "\")'>Törlés (refund)</button>";
+        var polyline = L.polyline(latlngs, {color: color, weight: weight}).addTo(map);
+        polyline.bindPopup(popupContent);
+        cableLayers[cid] = polyline;
+      }
+    }
+
+    function installDevice(buildingId) {
+      $.post("/install/" + buildingId, function(response) {
+        alert(response.message);
+        loadState();
+      });
+    }
+
+    function repairDevice(buildingId) {
+      $.post("/repair_device/" + buildingId, function(response) {
+        alert(response.message);
+        loadState();
+      });
+    }
+
+    function repairCable(cableId) {
+      $.post("/repair_cable/" + cableId, function(response) {
+        alert(response.message);
+        loadState();
+      });
+    }
+
+    function deleteCable(cableId) {
+      $.post("/delete_cable/" + cableId, function(response) {
+        alert(response.message);
+        loadState();
+      });
+    }
+
+    function selectDevice(buildingId) {
+      if (!pendingConnection) {
+        pendingConnection = { from: buildingId };
+        alert("Első épület kiválasztva: " + gameState.buildings[buildingId].name);
+      } else if (!pendingConnection.to) {
+        if (pendingConnection.from === buildingId) {
+          pendingConnection = null;
+          return;
+        }
+        pendingConnection.to = buildingId;
+        // Számoljuk ki a két épület közti távolságot
+        var b1 = gameState.buildings[pendingConnection.from];
+        var b2 = gameState.buildings[pendingConnection.to];
+        var distance = computeDistance(b1.lat, b1.lng, b2.lat, b2.lng);
+        var baseCost = Math.round(distance * cableCostPerKm);
+        var selectElem = document.getElementById("cableSelect");
+        selectElem.innerHTML = "";
+        for (var level = 1; level <= 5; level++) {
+          var cost = baseCost * level;
+          var optionText = "";
+          if (level === 1) optionText = "1-es szint (10 Mbit/s) - Ár: " + cost;
+          else if (level === 2) optionText = "2-es szint (100 Mbit/s) - Ár: " + cost;
+          else if (level === 3) optionText = "3-as szint (1 Gbit/s) - Ár: " + cost;
+          else if (level === 4) optionText = "4-es szint (10 Gbit/s) - Ár: " + cost;
+          else if (level === 5) optionText = "5-ös szint (100 Gbit/s) - Ár: " + cost;
+          var option = document.createElement("option");
+          option.value = level;
+          option.text = optionText;
+          selectElem.add(option);
+        }
+        document.getElementById("cableMenu").style.display = "block";
+      }
+    }
+
+    document.getElementById("connectCableBtn").onclick = function() {
+      var cableLevel = document.getElementById("cableSelect").value;
+      $.ajax({
+        url: "/connect",
+        method: "POST",
+        contentType: "application/json",
+        data: JSON.stringify({
+          from: pendingConnection.from,
+          to: pendingConnection.to,
+          level: cableLevel
+        }),
+        success: function(response) {
+          alert(response.message);
+          pendingConnection = null;
+          document.getElementById("cableMenu").style.display = "none";
+          loadState();
+        }
+      });
+    };
+
+    document.getElementById("cancelCableBtn").onclick = function() {
+      pendingConnection = null;
+      document.getElementById("cableMenu").style.display = "none";
+      alert("Kapcsolat megszakítva.");
+    };
+
+    function upgradeCable(cableId) {
+      $.post("/upgrade/" + cableId, function(response) {
+        alert(response.message);
+        loadState();
+      });
+    }
+
+    $("#simulate-btn").click(function(){
+      $.post("/simulate", function(response) {
+        var alertMsg = response.message;
+        if (response.overloaded.length) {
+          alertMsg += "\nTúlterhelt kábelek: " + response.overloaded.join(", ");
+        }
+        alert(alertMsg);
+        loadState();
+      });
+    });
+
+    // Újrakezdés gomb eseménykezelője
+    $("#reset-btn").click(function(){
+      $.post("/reset", function(response) {
+        alert(response.message);
+        loadState();
+      });
+    });
+
+    // Új épület hozzáadása 60 másodpercenként
+    setInterval(function(){
+      $.post("/add_building", function(response) {
+        if(response.success){
+          alert(response.message);
+          loadState();
+        }
+      });
+    }, 60000);
+
+    // Automatikus szimuláció percenként
+    setInterval(function(){
+      $.post("/simulate", function(response) {
+        console.log(response.message);
+        loadState();
+      });
+    }, 60000);
+
+    loadState();
+  </script>
+<!-- Footer -->
+<footer style="text-align:center; padding:10px; background:#f4f4f4; font-size:0.9em; margin-top:10px;">
+  <p>
+    A játék lényege, hogy egy valósághű ISP hálózatot szimulálj Budapest térképén. Feladataid közé tartozik az épületek eszközeinek telepítése és karbantartása, a megfelelő kapacitású kábelek kiválasztása, valamint azok bekötése az épületek között és az internet kijárathoz. 
+    <br>
+    <strong>Hova kell bekötni?</strong> 
+    <br>
+    - Telepítsd az eszközöket az egyes épületekhez, majd az épületek közötti kábelek bekötésével építsd fel a hálózatot. 
+    <br>
+    - Különösen ügyelj arra, hogy az összes forgalom az internet kijárathoz (a "EXIT" (Piros) node-hoz) vezető útvonalon haladjon, mert minél messzebbről érkezik az internet, annál nagyobb bevételt generálsz.
+    <br>
+    A cél, hogy optimalizáld a költségeket, kerüld a túlterhelést, és a lehető legnagyobb bevételt érd el a hálózatod működtetése során!
+  </p>
+</footer>
+</body>
+</html>
